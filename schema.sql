@@ -5,7 +5,10 @@ CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT UNIQUE NOT NULL,
     password TEXT NOT NULL,
-    monthly_salary REAL DEFAULT 0,
+    monthly_salary REAL DEFAULT 0,       -- 基础工资(月)
+    seniority_bonus REAL DEFAULT 0,      -- 工龄奖
+    skill_bonus REAL DEFAULT 0,          -- 技能奖
+    meal_allowance REAL DEFAULT 0,       -- 伙食费
     standard_on_time TEXT DEFAULT '09:00',
     standard_off_time TEXT DEFAULT '18:00',
     lunch_start TEXT DEFAULT '12:00',

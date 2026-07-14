@@ -106,6 +106,11 @@ function calcOvertimePay(hours, rate, monthlySalary) {
   return Math.round(hours * hourlyRate * rate * 100) / 100;
 }
 
+// 计算总月薪（基础工资 + 工龄奖 + 技能奖 + 伙食费）
+function getTotalSalary(user) {
+  return (user.monthly_salary || 0) + (user.seniority_bonus || 0) + (user.skill_bonus || 0) + (user.meal_allowance || 0);
+}
+
 // 根据日期类型获取倍率
 function getRate(dayType) {
   switch (dayType) {
@@ -118,6 +123,12 @@ function getRate(dayType) {
 // 格式化金额
 function formatMoney(num) {
   return num.toFixed(2);
+}
+
+// 当前时间字符串 HH:MM
+function nowTimeStr() {
+  const d = new Date();
+  return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
 }
 
 // ===== 路由处理 =====
@@ -174,6 +185,9 @@ async function handleApi(request, env, path) {
     return json({
       username: user.username,
       monthly_salary: user.monthly_salary,
+      seniority_bonus: user.seniority_bonus || 0,
+      skill_bonus: user.skill_bonus || 0,
+      meal_allowance: user.meal_allowance || 0,
       standard_on_time: user.standard_on_time,
       standard_off_time: user.standard_off_time,
       lunch_start: user.lunch_start || '12:00',
@@ -184,8 +198,12 @@ async function handleApi(request, env, path) {
   }
 
   if (path === '/api/settings' && method === 'PUT') {
-    const { monthly_salary, standard_on_time, standard_off_time, lunch_start, lunch_end, dinner_start, dinner_end } = await request.json();
-    const newSalary = monthly_salary || 0;
+    const { monthly_salary, seniority_bonus, skill_bonus, meal_allowance, standard_on_time, standard_off_time, lunch_start, lunch_end, dinner_start, dinner_end } = await request.json();
+    const newBaseSalary = monthly_salary || 0;
+    const newSeniority = seniority_bonus || 0;
+    const newSkill = skill_bonus || 0;
+    const newMeal = meal_allowance || 0;
+    const newTotalSalary = newBaseSalary + newSeniority + newSkill + newMeal;
     const newOffTime = standard_off_time || '18:00';
     const newLunchStart = lunch_start || '12:00';
     const newLunchEnd = lunch_end || '13:00';
@@ -194,8 +212,8 @@ async function handleApi(request, env, path) {
     const userBreaks = buildBreaks(newLunchStart, newLunchEnd, newDinnerStart, newDinnerEnd);
 
     await env.DB.prepare(
-      'UPDATE users SET monthly_salary = ?, standard_on_time = ?, standard_off_time = ?, lunch_start = ?, lunch_end = ?, dinner_start = ?, dinner_end = ? WHERE id = ?'
-    ).bind(newSalary, standard_on_time || '09:00', newOffTime, newLunchStart, newLunchEnd, newDinnerStart, newDinnerEnd, user.id).run();
+      'UPDATE users SET monthly_salary = ?, seniority_bonus = ?, skill_bonus = ?, meal_allowance = ?, standard_on_time = ?, standard_off_time = ?, lunch_start = ?, lunch_end = ?, dinner_start = ?, dinner_end = ? WHERE id = ?'
+    ).bind(newBaseSalary, newSeniority, newSkill, newMeal, standard_on_time || '09:00', newOffTime, newLunchStart, newLunchEnd, newDinnerStart, newDinnerEnd, user.id).run();
 
     // 重新计算该用户所有加班记录的时长和金额
     const { results: allRecords } = await env.DB.prepare(
@@ -203,9 +221,9 @@ async function handleApi(request, env, path) {
     ).bind(user.id).all();
 
     for (const r of allRecords) {
-      const newHours = calcOvertimeHours(r.off_time, newOffTime, r.overtime_start || null, userBreaks);
-      // rate 不变（调休的保持1，其他的保持原倍率）
-      const newPay = calcOvertimePay(newHours, r.rate, newSalary);
+      // 手动输入时长的记录不重算时长，但重算金额
+      const newHours = r.manual_hours != null ? r.manual_hours : calcOvertimeHours(r.off_time, newOffTime, r.overtime_start || null, userBreaks);
+      const newPay = calcOvertimePay(newHours, r.rate, newTotalSalary);
       await env.DB.prepare(
         'UPDATE overtime_records SET overtime_hours = ?, overtime_pay = ? WHERE id = ?'
       ).bind(newHours, newPay, r.id).run();
@@ -216,8 +234,10 @@ async function handleApi(request, env, path) {
 
   // ----- 加班打卡 -----
   if (path === '/api/overtime' && method === 'POST') {
-    const { date, off_time, overtime_start, note } = await request.json();
-    if (!date || !off_time) return json({ error: '日期和下班时间不能为空' }, 400);
+    const { date, off_time, overtime_start, manual_hours, note } = await request.json();
+    if (!date) return json({ error: '日期不能为空' }, 400);
+    // 手动时长模式不需要 off_time，时间模式需要
+    if (manual_hours == null && !off_time) return json({ error: '下班时间不能为空' }, 400);
 
     // 检查是否已有记录
     const existing = await env.DB.prepare(
@@ -227,15 +247,26 @@ async function handleApi(request, env, path) {
 
     const dayType = await getDayType(env, date);
     const rate = getRate(dayType);
+    const totalSalary = getTotalSalary(user);
     const userBreaks = buildBreaks(user.lunch_start || '12:00', user.lunch_end || '13:00', user.dinner_start || '17:30', user.dinner_end || '18:30');
-    const hours = calcOvertimeHours(off_time, user.standard_off_time, overtime_start || null, userBreaks);
-    const pay = calcOvertimePay(hours, rate, user.monthly_salary);
+
+    let hours, finalOffTime;
+    if (manual_hours != null) {
+      // 手动输入时长模式
+      hours = Math.round(manual_hours * 4) / 4; // 按15分钟取整
+      finalOffTime = off_time || nowTimeStr();
+    } else {
+      // 时间计算模式
+      hours = calcOvertimeHours(off_time, user.standard_off_time, overtime_start || null, userBreaks);
+      finalOffTime = off_time;
+    }
+    const pay = calcOvertimePay(hours, rate, totalSalary);
 
     const id = uuid();
     await env.DB.prepare(
-      `INSERT INTO overtime_records (id, user_id, date, off_time, overtime_start, overtime_hours, day_type, rate, overtime_pay, note)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(id, user.id, date, off_time, overtime_start || null, hours, dayType, rate, pay, note || '').run();
+      `INSERT INTO overtime_records (id, user_id, date, off_time, overtime_start, manual_hours, overtime_hours, day_type, rate, overtime_pay, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(id, user.id, date, finalOffTime, overtime_start || null, manual_hours != null ? hours : null, hours, dayType, rate, pay, note || '').run();
 
     const record = await env.DB.prepare('SELECT * FROM overtime_records WHERE id = ?').bind(id).first();
     return json({ success: true, record });
@@ -266,22 +297,41 @@ async function handleApi(request, env, path) {
   // 修改加班记录
   if (path.startsWith('/api/overtime/') && method === 'PUT') {
     const id = path.split('/')[3];
-    const { off_time, overtime_start, note } = await request.json();
-    if (!off_time) return json({ error: '下班时间不能为空' }, 400);
+    const { off_time, overtime_start, manual_hours, note } = await request.json();
 
     const record = await env.DB.prepare(
       'SELECT * FROM overtime_records WHERE id = ? AND user_id = ?'
     ).bind(id, user.id).first();
     if (!record) return json({ error: '记录不存在' }, 400);
 
-    const otStart = overtime_start !== undefined ? (overtime_start || null) : (record.overtime_start || null);
+    const totalSalary = getTotalSalary(user);
     const userBreaks = buildBreaks(user.lunch_start || '12:00', user.lunch_end || '13:00', user.dinner_start || '17:30', user.dinner_end || '18:30');
-    const newHours = calcOvertimeHours(off_time, user.standard_off_time, otStart, userBreaks);
-    const newPay = calcOvertimePay(newHours, record.rate, user.monthly_salary);
+
+    let newHours, newOffTime, newManualHours;
+    if (manual_hours != null) {
+      // 手动时长模式
+      newHours = Math.round(manual_hours * 4) / 4;
+      newOffTime = off_time || record.off_time;
+      newManualHours = newHours;
+    } else if (off_time) {
+      // 时间计算模式
+      const otStart = overtime_start !== undefined ? (overtime_start || null) : (record.overtime_start || null);
+      newHours = calcOvertimeHours(off_time, user.standard_off_time, otStart, userBreaks);
+      newOffTime = off_time;
+      newManualHours = null;
+    } else {
+      // 没改时间，只改备注
+      newHours = record.overtime_hours;
+      newOffTime = record.off_time;
+      newManualHours = record.manual_hours;
+    }
+
+    const otStartVal = overtime_start !== undefined ? (overtime_start || null) : (record.overtime_start || null);
+    const newPay = calcOvertimePay(newHours, record.rate, totalSalary);
 
     await env.DB.prepare(
-      'UPDATE overtime_records SET off_time = ?, overtime_start = ?, overtime_hours = ?, overtime_pay = ?, note = ? WHERE id = ?'
-    ).bind(off_time, otStart, newHours, newPay, note !== undefined ? note : record.note, id).run();
+      'UPDATE overtime_records SET off_time = ?, overtime_start = ?, manual_hours = ?, overtime_hours = ?, overtime_pay = ?, note = ? WHERE id = ?'
+    ).bind(newOffTime, otStartVal, newManualHours, newHours, newPay, note !== undefined ? note : record.note, id).run();
 
     const updated = await env.DB.prepare(
       `SELECT o.*, c.comp_off_date FROM overtime_records o
@@ -328,7 +378,7 @@ async function handleApi(request, env, path) {
       // 将原加班记录状态改为已调休，倍率降为1（正常工作日）
       env.DB.prepare(
         'UPDATE overtime_records SET status = ?, rate = ?, overtime_pay = ? WHERE id = ?'
-      ).bind('comp_off', 1, calcOvertimePay(otRecord.overtime_hours, 1, user.monthly_salary), overtime_record_id),
+      ).bind('comp_off', 1, calcOvertimePay(otRecord.overtime_hours, 1, getTotalSalary(user)), overtime_record_id),
     ]);
 
     return json({ success: true, message: '调休成功' });
@@ -348,7 +398,7 @@ async function handleApi(request, env, path) {
       // 恢复原倍率
       env.DB.prepare(
         'UPDATE overtime_records SET status = ?, rate = ?, overtime_pay = ? WHERE id = ?'
-      ).bind('active', 2, calcOvertimePay(otRecord.overtime_hours, 2, user.monthly_salary), otId),
+      ).bind('active', 2, calcOvertimePay(otRecord.overtime_hours, 2, getTotalSalary(user)), otId),
     ]);
 
     return json({ success: true });
@@ -383,6 +433,11 @@ async function handleApi(request, env, path) {
       total_hours: Math.round(totalHours * 100) / 100,
       total_pay: Math.round(totalPay * 100) / 100,
       total_count: results.length,
+      base_salary: user.monthly_salary || 0,
+      seniority_bonus: user.seniority_bonus || 0,
+      skill_bonus: user.skill_bonus || 0,
+      meal_allowance: user.meal_allowance || 0,
+      monthly_total_salary: getTotalSalary(user),
       by_type: {
         workday: { ...byType.workday, hours: Math.round(byType.workday.hours * 100) / 100, pay: Math.round(byType.workday.pay * 100) / 100 },
         weekend: { ...byType.weekend, hours: Math.round(byType.weekend.hours * 100) / 100, pay: Math.round(byType.weekend.pay * 100) / 100 },
@@ -419,7 +474,20 @@ async function handleApi(request, env, path) {
     const dayType = await getDayType(env, date);
     const rate = getRate(dayType);
     const dayNames = { workday: '工作日', weekend: '休息日', holiday: '法定节假日' };
-    return json({ date, day_type: dayType, day_name: dayNames[dayType] || dayType, rate });
+
+    // 同时查该日期是否已有加班记录
+    const existingRecord = await env.DB.prepare(
+      'SELECT * FROM overtime_records WHERE user_id = ? AND date = ?'
+    ).bind(user.id, date).first();
+
+    return json({
+      date,
+      day_type: dayType,
+      day_name: dayNames[dayType] || dayType,
+      rate,
+      has_record: !!existingRecord,
+      record: existingRecord || null,
+    });
   }
 
   return json({ error: '接口不存在' }, 404);
@@ -659,11 +727,20 @@ const PAGE_SETTINGS = `
   <a href="/">返回</a>
 </div>
 <div class="card">
-  <h2>个人信息</h2>
+  <h2>薪资信息</h2>
   <div class="form-group"><label>用户名</label>
     <input id="username" type="text" disabled></div>
-  <div class="form-group"><label>月基本工资（元）</label>
-    <input id="salary" type="number" placeholder="如 8000"></div>
+  <div class="form-group"><label>基础工资（元/月）</label>
+    <input id="salary" type="number" placeholder="如 5000"></div>
+  <div class="form-group"><label>工龄奖（元/月）</label>
+    <input id="seniorityBonus" type="number" placeholder="如 500" value="0"></div>
+  <div class="form-group"><label>技能奖（元/月）</label>
+    <input id="skillBonus" type="number" placeholder="如 1000" value="0"></div>
+  <div class="form-group"><label>伙食费（元/月）</label>
+    <input id="mealAllowance" type="number" placeholder="如 300" value="0"></div>
+  <div style="font-size:12px;color:var(--text-dim);margin-bottom:16px">
+    加班费按以上各项总和计算时薪。时薪 = 总薪资 ÷ 21.75 ÷ 8
+  </div>
   <div class="form-group"><label>标准上班时间</label>
     <input id="onTime" type="time" value="09:00"></div>
   <div class="form-group"><label>标准下班时间</label>
@@ -734,6 +811,9 @@ async function api(path, opts = {}) {
   if (!data) return;
   document.getElementById('username').value = data.username;
   document.getElementById('salary').value = data.monthly_salary || '';
+  document.getElementById('seniorityBonus').value = data.seniority_bonus || 0;
+  document.getElementById('skillBonus').value = data.skill_bonus || 0;
+  document.getElementById('mealAllowance').value = data.meal_allowance || 0;
   document.getElementById('onTime').value = data.standard_on_time || '09:00';
   document.getElementById('offTime').value = data.standard_off_time || '18:00';
   document.getElementById('lunchStart').value = data.lunch_start || '12:00';
@@ -762,6 +842,9 @@ document.getElementById('saveBtn').onclick = async () => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       monthly_salary: parseFloat(document.getElementById('salary').value) || 0,
+      seniority_bonus: parseFloat(document.getElementById('seniorityBonus').value) || 0,
+      skill_bonus: parseFloat(document.getElementById('skillBonus').value) || 0,
+      meal_allowance: parseFloat(document.getElementById('mealAllowance').value) || 0,
       standard_on_time: document.getElementById('onTime').value,
       standard_off_time: document.getElementById('offTime').value,
       lunch_start: document.getElementById('lunchStart').value,
@@ -811,16 +894,44 @@ const PAGE_INDEX = `
     <label>日期</label>
     <input id="punchDate" type="date">
   </div>
-  <div id="todayInfo" style="margin-bottom:16px;font-size:14px;color:var(--text-dim)"></div>
-  <div class="form-group">
-    <label>下班时间</label>
-    <input id="offTime" type="time">
+  <div id="todayInfo" style="margin-bottom:12px;font-size:14px;color:var(--text-dim)"></div>
+  <div id="existingRecordInfo" style="display:none;margin-bottom:12px;padding:10px;border-radius:8px;background:rgba(0,184,148,.1);border:1px solid rgba(0,184,148,.3);font-size:13px"></div>
+
+  <!-- 模式切换 -->
+  <div style="display:flex;gap:0;margin-bottom:16px;border-radius:8px;overflow:hidden;border:1px solid var(--border)">
+    <button id="modeTime" class="mode-btn active" style="flex:1;padding:8px;border:none;background:var(--primary);color:#fff;font-size:14px;cursor:pointer">按时间</button>
+    <button id="modeHours" class="mode-btn" style="flex:1;padding:8px;border:none;background:var(--card);color:var(--text-dim);font-size:14px;cursor:pointer">按时长</button>
   </div>
-  <div class="form-group">
-    <label>加班开始时间（可选）</label>
-    <input id="overtimeStart" type="time">
-    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">不填则从标准下班时间算。周末全天加班填上班时间（如08:00），系统自动扣午休和晚餐</div>
+
+  <!-- 按时间模式 -->
+  <div id="timeModeFields">
+    <div class="form-group">
+      <label>下班时间</label>
+      <input id="offTime" type="time">
+    </div>
+    <div class="form-group">
+      <label>加班开始时间（可选）</label>
+      <input id="overtimeStart" type="time">
+      <div style="font-size:12px;color:var(--text-dim);margin-top:4px">不填则从标准下班时间算。周末全天加班填上班时间（如08:00），系统自动扣午休和晚餐</div>
+    </div>
   </div>
+
+  <!-- 按时长模式 -->
+  <div id="hoursModeFields" style="display:none">
+    <div class="form-group">
+      <label>加班时长（小时）</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="quick-hours" data-hours="1" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-size:14px">1h</button>
+        <button class="quick-hours" data-hours="2" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-size:14px">2h</button>
+        <button class="quick-hours" data-hours="2.5" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-size:14px">2.5h</button>
+        <button class="quick-hours" data-hours="3" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-size:14px">3h</button>
+        <button class="quick-hours" data-hours="4" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-size:14px">4h</button>
+        <button class="quick-hours" data-hours="8" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-size:14px">8h</button>
+      </div>
+      <input id="manualHours" type="number" step="0.25" placeholder="或输入自定义时长" style="margin-top:8px">
+    </div>
+  </div>
+
   <div class="form-group">
     <label>备注（可选）</label>
     <input id="note" type="text" placeholder="如：赶项目进度">
@@ -841,6 +952,7 @@ const PAGE_INDEX = `
       <div class="label">加班费(元)</div>
     </div>
   </div>
+  <div id="salaryBreakdown" style="margin-top:12px;font-size:13px;color:var(--text-dim);border-top:1px solid var(--border);padding-top:12px"></div>
 </div>
 
 <!-- 分类统计 -->
@@ -880,6 +992,10 @@ const PAGE_INDEX = `
     <div class="form-group"><label>加班开始时间（可选）</label>
       <input id="editOvertimeStart" type="time">
     </div>
+    <div class="form-group"><label>加班时长（直接修改，可选）</label>
+      <input id="editManualHours" type="number" step="0.25" placeholder="留空则按时间自动计算">
+      <div style="font-size:12px;color:var(--text-dim);margin-top:4px">填了就直接用这个时长，不填则按下班时间自动算</div>
+    </div>
     <div class="form-group"><label>备注</label>
       <input id="editNote" type="text" placeholder="如：赶项目进度">
     </div>
@@ -902,6 +1018,37 @@ document.getElementById('punchDate').value = todayStr;
 document.getElementById('offTime').value = nowTime;
 document.getElementById('overtimeStart').value = localStorage.getItem('overtimeStart') || '';
 
+let punchMode = 'time'; // 'time' or 'hours'
+
+// 模式切换
+document.getElementById('modeTime').onclick = () => {
+  punchMode = 'time';
+  document.getElementById('modeTime').style.background = 'var(--primary)';
+  document.getElementById('modeTime').style.color = '#fff';
+  document.getElementById('modeHours').style.background = 'var(--card)';
+  document.getElementById('modeHours').style.color = 'var(--text-dim)';
+  document.getElementById('timeModeFields').style.display = '';
+  document.getElementById('hoursModeFields').style.display = 'none';
+};
+document.getElementById('modeHours').onclick = () => {
+  punchMode = 'hours';
+  document.getElementById('modeHours').style.background = 'var(--primary)';
+  document.getElementById('modeHours').style.color = '#fff';
+  document.getElementById('modeTime').style.background = 'var(--card)';
+  document.getElementById('modeTime').style.color = 'var(--text-dim)';
+  document.getElementById('hoursModeFields').style.display = '';
+  document.getElementById('timeModeFields').style.display = 'none';
+};
+
+// 快捷时长按钮
+document.querySelectorAll('.quick-hours').forEach(btn => {
+  btn.onclick = () => {
+    document.getElementById('manualHours').value = btn.dataset.hours;
+    document.querySelectorAll('.quick-hours').forEach(b => b.style.borderColor = 'var(--border)');
+    btn.style.borderColor = 'var(--primary)';
+  };
+});
+
 function showToast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');
@@ -920,12 +1067,25 @@ async function api(path, opts = {}) {
 const dayNames = { workday: '工作日', weekend: '休息日', holiday: '法定节假日' };
 const rateNames = { 1.5: '1.5倍', 2: '2倍', 3: '3倍', 1: '1倍(调休)' };
 
-// 加载选中日期的信息
+// 加载选中日期的信息（含是否已有记录）
 async function loadDayInfo(dateStr) {
   const data = await api('/api/day-type?date=' + dateStr);
   if (!data) return;
   document.getElementById('todayInfo').innerHTML =
     dateStr + ' · ' + data.day_name + ' · ' + rateNames[data.rate] + '时薪';
+
+  // 显示已有记录
+  const infoBox = document.getElementById('existingRecordInfo');
+  if (data.has_record && data.record) {
+    const r = data.record;
+    infoBox.style.display = 'block';
+    infoBox.innerHTML = '<span style="color:var(--green)">已有记录</span> · 下班 ' + r.off_time +
+      (r.overtime_start ? ' · 加班开始 ' + r.overtime_start : '') +
+      ' · ' + r.overtime_hours + 'h · ¥' + r.overtime_pay.toFixed(2) +
+      (r.note ? ' · ' + r.note : '');
+  } else {
+    infoBox.style.display = 'none';
+  }
 }
 loadDayInfo(todayStr);
 
@@ -937,19 +1097,27 @@ document.getElementById('punchDate').onchange = () => {
 // 打卡
 document.getElementById('punchBtn').onclick = async () => {
   const punchDate = document.getElementById('punchDate').value;
-  const offTime = document.getElementById('offTime').value;
-  const overtimeStart = document.getElementById('overtimeStart').value;
   const note = document.getElementById('note').value;
   if (!punchDate) { showToast('请选择日期'); return; }
-  if (!offTime) { showToast('请选择下班时间'); return; }
 
-  // 记忆加班开始时间
-  if (overtimeStart) localStorage.setItem('overtimeStart', overtimeStart); else localStorage.removeItem('overtimeStart');
+  let body;
+  if (punchMode === 'hours') {
+    const manualHours = parseFloat(document.getElementById('manualHours').value);
+    if (!manualHours || manualHours <= 0) { showToast('请输入加班时长'); return; }
+    body = { date: punchDate, manual_hours: manualHours, note };
+  } else {
+    const offTime = document.getElementById('offTime').value;
+    const overtimeStart = document.getElementById('overtimeStart').value;
+    if (!offTime) { showToast('请选择下班时间'); return; }
+    // 记忆加班开始时间
+    if (overtimeStart) localStorage.setItem('overtimeStart', overtimeStart); else localStorage.removeItem('overtimeStart');
+    body = { date: punchDate, off_time: offTime, overtime_start: overtimeStart || null, note };
+  }
 
   const data = await api('/api/overtime', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ date: punchDate, off_time: offTime, overtime_start: overtimeStart || null, note }),
+    body: JSON.stringify(body),
   });
 
   if (!data) return;
@@ -970,6 +1138,20 @@ async function loadStats() {
   if (!data) return;
   document.getElementById('totalHours').textContent = data.total_hours;
   document.getElementById('totalPay').textContent = '¥' + data.total_pay.toFixed(2);
+
+  // 薪资明细
+  const breakdown = document.getElementById('salaryBreakdown');
+  const base = data.base_salary || 0;
+  const seniority = data.seniority_bonus || 0;
+  const skill = data.skill_bonus || 0;
+  const meal = data.meal_allowance || 0;
+  const totalSalary = data.monthly_total_salary || 0;
+  breakdown.innerHTML = '基础工资 ¥' + base.toFixed(0) +
+    ' + 工龄奖 ¥' + seniority.toFixed(0) +
+    ' + 技能奖 ¥' + skill.toFixed(0) +
+    ' + 伙食费 ¥' + meal.toFixed(0) +
+    ' = <span style="color:var(--text)">月薪 ¥' + totalSalary.toFixed(0) + '</span> · ' +
+    '本月加班费 <span style="color:var(--green)">¥' + data.total_pay.toFixed(2) + '</span>';
 
   let typeHtml = '';
   const types = [
@@ -1006,7 +1188,7 @@ async function loadRecords() {
 
     // 操作按钮
     let actions = '<div class="record-actions">' +
-      '<button class="btn-sm" onclick="openEditModal(\\''+r.id+'\\',\\''+r.off_time+'\\',\\''+(r.overtime_start||'')+'\\',\\''+(r.note||'').replace(/'/g,'\\\\\\'')+'\\')">编辑</button>' +
+      '<button class="btn-sm" onclick="openEditModal(\\''+r.id+'\\',\\''+r.off_time+'\\',\\''+(r.overtime_start||'')+'\\',\\''+(r.manual_hours!=null?r.manual_hours:'')+'\\',\\''+(r.note||'').replace(/'/g,'\\\\\\'')+'\\')">编辑</button>' +
       '<button class="btn-sm danger" onclick="deleteRecord(\\''+r.id+'\\')">删除</button>';
     if (r.day_type === 'weekend' && r.status === 'active') {
       actions += '<button class="btn-sm" onclick="openCompoffModal(\\''+r.id+'\\',\\''+r.date+'\\',\\''+r.overtime_hours+'\\')">调休</button>';
@@ -1016,10 +1198,11 @@ async function loadRecords() {
     actions += '</div>';
 
     const otStartText = r.overtime_start ? ' · 加班开始 ' + r.overtime_start : '';
+    const manualTag = r.manual_hours != null ? ' <span style="color:var(--primary);font-size:11px">手动</span>' : '';
     html += '<div class="record"><div class="record-info"><div class="record-date">' +
       r.date + ' <span class="tag ' + tagClass + '">' + dayNames[r.day_type] +
       '</span>' + statusTag + '</div><div class="record-detail">下班 ' + r.off_time +
-      otStartText + ' · ' + r.overtime_hours + 'h · ' + rateNames[r.rate] +
+      otStartText + ' · ' + r.overtime_hours + 'h' + manualTag + ' · ' + rateNames[r.rate] +
       (r.note ? ' · ' + r.note : '') + '</div>' + compOffInfo + actions +
       '</div><div class="record-pay"><div class="amount green">¥' +
       r.overtime_pay.toFixed(2) + '</div><div class="hours">' + r.overtime_hours + 'h</div></div></div>';
@@ -1030,10 +1213,11 @@ async function loadRecords() {
 // ===== 编辑/删除记录 =====
 let currentEditId = null;
 
-function openEditModal(recordId, offTime, overtimeStart, note) {
+function openEditModal(recordId, offTime, overtimeStart, manualHours, note) {
   currentEditId = recordId;
   document.getElementById('editOffTime').value = offTime;
   document.getElementById('editOvertimeStart').value = overtimeStart || '';
+  document.getElementById('editManualHours').value = manualHours || '';
   document.getElementById('editNote').value = note;
   document.getElementById('editModal').classList.add('show');
 }
@@ -1055,13 +1239,22 @@ document.getElementById('cancelEditBtn').onclick = () => {
 document.getElementById('confirmEditBtn').onclick = async () => {
   const offTime = document.getElementById('editOffTime').value;
   const overtimeStart = document.getElementById('editOvertimeStart').value;
+  const manualHoursVal = document.getElementById('editManualHours').value;
   const note = document.getElementById('editNote').value;
-  if (!offTime) { showToast('请选择下班时间'); return; }
+
+  const body = { note };
+  if (manualHoursVal) {
+    body.manual_hours = parseFloat(manualHoursVal);
+  } else {
+    if (!offTime) { showToast('请选择下班时间'); return; }
+    body.off_time = offTime;
+    body.overtime_start = overtimeStart || null;
+  }
 
   const data = await api('/api/overtime/' + currentEditId, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ off_time: offTime, overtime_start: overtimeStart || null, note }),
+    body: JSON.stringify(body),
   });
   if (!data) return;
   if (data.error) { showToast(data.error); return; }
