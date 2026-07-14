@@ -1,0 +1,15 @@
+{
+  "name": "overtime-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create overtime-tracker",
+    "db:init": "wrangler d1 execute overtime-tracker --remote --file=schema.sql",
+    "db:local": "wrangler d1 execute overtime-tracker --local --file=schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
